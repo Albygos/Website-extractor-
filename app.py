@@ -1,18 +1,32 @@
+# ==============================================================================
+# 1. FILE: vercel.json (Must be in root for Vercel deployment)
+# {
+#   "version": 2,
+#   "builds": [{"src": "app.py", "use": "@vercel/python"}],
+#   "routes": [{"src": "/(.*)", "dest": "app.py"}],
+#   "functions": {"app.py": {"maxDuration": 60}}
+# }
+# ==============================================================================
+# 2. FILE: requirements.txt (Must be in root)
+# Flask==3.0.0
+# beautifulsoup4==4.12.2
+# playwright==1.40.0
+# ==============================================================================
+# 3. FILE: app.py
+# ==============================================================================
+
 import os
 import re
-import base64
-import logging
-import mimetypes
 import tempfile
 import uuid
+import logging
 from urllib.parse import urljoin, urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import Flask, request, jsonify, send_file, render_template_string
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
+
+# Import Playwright for Headless Browser Execution
+from playwright.sync_api import sync_playwright
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
@@ -20,8 +34,6 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-MAX_RESOURCE_SIZE = 5 * 1024 * 1024  # 5 MB per resource limit
-MAX_CONCURRENT_DOWNLOADS = 10
 TEMP_DIR = tempfile.gettempdir()
 CSS_URL_REGEX = re.compile(r'url\(\s*(["\']?)([^)]+)\1\s*\)', re.IGNORECASE)
 
@@ -32,12 +44,15 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Web Archiver (Vercel Edition)</title>
+    <title>Stealth Web Archiver</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        body { background-color: #f8f9fa; padding-top: 40px; }
-        .card { box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        body { background-color: #121212; color: #ffffff; padding-top: 40px; }
+        .card { background-color: #1e1e1e; border: 1px solid #333; box-shadow: 0 4px 6px rgba(0,0,0,0.5); }
+        .form-control { background-color: #2a2a2a; border: 1px solid #444; color: #fff; }
+        .form-control:focus { background-color: #333; color: #fff; border-color: #0d6efd; box-shadow: none; }
         #loading-container { display: none; }
+        .stealth-badge { font-size: 0.8rem; background: #dc3545; padding: 3px 8px; border-radius: 12px; margin-bottom:15px; display:inline-block; font-weight:bold;}
     </style>
 </head>
 <body>
@@ -45,28 +60,29 @@ HTML_TEMPLATE = """
     <div class="row justify-content-center">
         <div class="col-md-8">
             <div class="card">
-                <div class="card-header bg-primary text-white">
-                    <h4 class="mb-0">Web Page Archiver (Synchronous)</h4>
+                <div class="card-header bg-primary text-white border-bottom-0">
+                    <h4 class="mb-0">Anti-Bot Stealth Archiver</h4>
                 </div>
                 <div class="card-body">
+                    <div class="stealth-badge">WAF Bypass Enabled (Akamai/Cloudflare/Datadome)</div>
                     <p class="text-muted small">
-                        Enter a URL to download a self-contained HTML file. <br>
-                        <strong>Note:</strong> Vercel's free tier has a strict 10-second timeout. Highly complex pages may fail to process in time.
+                        This tool mimics a legitimate browser, waits <strong>30 seconds</strong> for React/Angular/Vue components to render, and forces the browser to fetch assets internally to bypass 403 Forbidden firewall blocks.<br>
                     </p>
                     
                     <form id="archiveForm">
                         <div class="mb-3">
                             <label for="url" class="form-label">Target URL</label>
-                            <input type="url" class="form-control" id="url" placeholder="https://example.com" required>
+                            <input type="url" class="form-control" id="url" placeholder="https://www.flipkart.com" required>
                         </div>
-                        <button type="submit" class="btn btn-primary w-100" id="btn-submit">Generate & Download Archive</button>
+                        <button type="submit" class="btn btn-primary w-100" id="btn-submit">Bypass Security & Archive</button>
                     </form>
 
                     <div id="loading-container" class="mt-4 text-center">
                         <div class="spinner-border text-primary" role="status">
                             <span class="visually-hidden">Loading...</span>
                         </div>
-                        <p class="mt-2 fw-bold" id="status-text">Downloading and converting assets... Please wait.</p>
+                        <p class="mt-2 fw-bold text-light" id="status-text">Booting Stealth Browser... waiting 30s...</p>
+                        <p class="text-muted small">Do not close this tab. Complex sites take ~45-60 seconds.</p>
                     </div>
                     
                     <div id="error-box" class="alert alert-danger mt-3" style="display: none;"></div>
@@ -96,7 +112,7 @@ document.getElementById('archiveForm').addEventListener('submit', async function
         });
         
         if (!response.ok) {
-            let errorMsg = "Server error or Vercel 10-second timeout exceeded.";
+            let errorMsg = "Server error or timeout exceeded.";
             try {
                 const data = await response.json();
                 if (data.error) errorMsg = data.error;
@@ -104,17 +120,15 @@ document.getElementById('archiveForm').addEventListener('submit', async function
             throw new Error(errorMsg);
         }
 
-        // Handle binary file download directly
         const blob = await response.blob();
         const downloadUrl = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
         
-        // Extract domain for filename
         const urlObj = new URL(url);
         const domain = urlObj.hostname.replace(/\./g, '_');
         
         a.href = downloadUrl;
-        a.download = `${domain}_archive.html`;
+        a.download = `${domain}_stealth_archive.html`;
         document.body.appendChild(a);
         a.click();
         a.remove();
@@ -136,49 +150,62 @@ document.getElementById('archiveForm').addEventListener('submit', async function
 </html>
 """
 
-class WebArchiver:
+# JavaScript Payload injected into Playwright to fetch assets securely
+# Bypasses WAF by using the authenticated browser's own networking stack
+BROWSER_FETCHER_JS = """
+async (args) => {
+    try {
+        const resp = await fetch(args.url);
+        if (!resp.ok) return { success: false, error: `HTTP ${resp.status}` };
+        
+        if (args.type === 'text') {
+            const text = await resp.text();
+            return { success: true, data: text };
+        } else {
+            const blob = await resp.blob();
+            return await new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve({ success: true, data: reader.result });
+                reader.onerror = () => resolve({ success: false, error: 'Blob conversion failed' });
+                reader.readAsDataURL(blob);
+            });
+        }
+    } catch(err) {
+        return { success: false, error: err.toString() };
+    }
+}
+"""
+
+class StealthArchiver:
     def __init__(self, target_url):
         self.target_url = target_url
-        self.session = requests.Session()
-        retries = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
-        self.session.mount('http://', HTTPAdapter(max_retries=retries))
-        self.session.mount('https://', HTTPAdapter(max_retries=retries))
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        })
+        self.final_url = target_url
         self.resource_cache = {}
+        self.page = None
 
-    def fetch_resource(self, url, is_text=False):
-        if url.startswith('data:'): return url 
+    def fetch_via_browser(self, url, res_type):
+        """Asks the browser environment to download the resource to perfectly spoof TLS and Cookies."""
+        if url.startswith('data:'): return url
         if url in self.resource_cache: return self.resource_cache[url]
-
+        
         try:
-            # Shortened timeout to survive Vercel's limits
-            resp = self.session.get(url, stream=True, timeout=5)
-            resp.raise_for_status()
-
-            if int(resp.headers.get('Content-Length', 0)) > MAX_RESOURCE_SIZE:
-                return None
-
-            content = resp.content
-            if is_text:
-                encoding = resp.encoding if resp.encoding else 'utf-8'
-                result = content.decode(encoding, errors='replace')
-                self.resource_cache[url] = result
-                return result
+            logger.info(f"Browser fetching: {url}")
+            # Ask JS to fetch it
+            result = self.page.evaluate(BROWSER_FETCHER_JS, {"url": url, "type": res_type})
+            
+            if result and result.get('success'):
+                data = result['data']
+                self.resource_cache[url] = data
+                return data
             else:
-                mime_type = resp.headers.get('Content-Type', '').split(';')[0]
-                if not mime_type:
-                    mime_type = mimetypes.guess_type(url)[0] or 'application/octet-stream'
-                
-                b64_data = base64.b64encode(content).decode('utf-8')
-                data_uri = f"data:{mime_type};base64,{b64_data}"
-                self.resource_cache[url] = data_uri
-                return data_uri
-        except Exception:
+                logger.warning(f"Browser fetch failed for {url}: {result.get('error')}")
+                return None
+        except Exception as e:
+            logger.error(f"Execution error fetching {url}: {e}")
             return None
 
     def process_css_content(self, css_text, base_url):
+        """Finds nested URLs in CSS and fetches them via the browser."""
         def replacer(match):
             quote = match.group(1)
             inner_url = match.group(2).strip()
@@ -186,90 +213,133 @@ class WebArchiver:
                 return match.group(0)
             
             absolute_url = urljoin(base_url, inner_url)
-            data_uri = self.fetch_resource(absolute_url)
-            if data_uri: return f"url({quote}{data_uri}{quote})"
+            data_uri = self.fetch_via_browser(absolute_url, res_type="base64")
+            
+            if data_uri:
+                return f"url({quote}{data_uri}{quote})"
             return match.group(0)
+            
         return CSS_URL_REGEX.sub(replacer, css_text)
 
     def process(self):
-        main_resp = self.session.get(self.target_url, timeout=10)
-        main_resp.raise_for_status()
+        html_content = ""
         
-        main_resp.encoding = main_resp.apparent_encoding or 'utf-8'
-        soup = BeautifulSoup(main_resp.text, 'html.parser')
-        
-        base_tag = soup.find('base')
-        base_url = urljoin(self.target_url, base_tag['href']) if base_tag and base_tag.has_attr('href') else main_resp.url
+        with sync_playwright() as p:
+            # ADVANCED TRICK 1: Anti-Detection Launch Arguments & CORS Disabling
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    '--disable-web-security',              # Bypass CORS checks to allow fetching CDN assets
+                    '--disable-blink-features=AutomationControlled', # Hide headless flag from Datadome/Cloudflare
+                    '--no-sandbox', 
+                    '--disable-setuid-sandbox'
+                ]
+            )
+            
+            # ADVANCED TRICK 2: Spoof realistic User-Agent and Viewport
+            context = browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                viewport={'width': 1920, 'height': 1080},
+                device_scale_factor=1,
+                has_touch=False,
+                is_mobile=False
+            )
+            
+            # ADVANCED TRICK 3: Inject script to scrub webdriver properties before page loads
+            context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.navigator.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            """)
+            
+            self.page = context.new_page()
+            
+            try:
+                logger.info(f"Navigating to {self.target_url}")
+                self.page.goto(self.target_url, wait_until='domcontentloaded', timeout=40000)
+            except Exception as e:
+                logger.warning(f"Navigation issue (Continuing anyway): {e}")
 
-        assets_to_download = []
-        
-        for img in soup.find_all(['img', 'source']):
-            for attr in ['src', 'srcset', 'data-src']:
-                if img.has_attr(attr):
-                    urls = [u.split()[0] for u in img[attr].split(',')]
-                    for u in urls:
-                        if u and not u.startswith('data:'):
-                            assets_to_download.append((img, attr, u, urljoin(base_url, u), 'image'))
+            # Hard wait for React/JS components to load in fully
+            logger.info("Waiting 30 seconds for dynamic content...")
+            self.page.wait_for_timeout(30000)
+            
+            # Scroll down to trigger lazy-loaded images (Common in E-commerce like Flipkart)
+            self.page.evaluate("window.scrollTo(0, document.body.scrollHeight/2);")
+            self.page.wait_for_timeout(1000)
+            self.page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
+            self.page.wait_for_timeout(2000)
 
-        for link in soup.find_all('link', rel='stylesheet'):
-            if link.has_attr('href'):
-                u = link['href']
-                assets_to_download.append((link, 'href', u, urljoin(base_url, u), 'css'))
+            html_content = self.page.content()
+            self.final_url = self.page.url 
 
-        for script in soup.find_all('script', src=True):
-            u = script['src']
-            assets_to_download.append((script, 'src', u, urljoin(base_url, u), 'js'))
+            # PARSE DOM
+            soup = BeautifulSoup(html_content, 'html.parser')
+            base_tag = soup.find('base')
+            base_url = urljoin(self.final_url, base_tag['href']) if base_tag and base_tag.has_attr('href') else self.final_url
 
-        downloaded_data = {}
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as executor:
-            future_to_req = {}
-            for tag, attr, orig_url, abs_url, res_type in assets_to_download:
-                if abs_url not in downloaded_data:
-                    future = executor.submit(self.fetch_resource, abs_url, is_text=(res_type in ['css', 'js']))
-                    future_to_req[future] = (abs_url, res_type)
+            # COLLECT ASSETS
+            images_to_fetch = []
+            for img in soup.find_all(['img', 'source']):
+                for attr in ['src', 'srcset', 'data-src', 'data-url']: # Added data-url for lazy loaders
+                    if img.has_attr(attr) and not img[attr].startswith('data:'):
+                        images_to_fetch.append((img, attr, img[attr]))
 
-            for future in as_completed(future_to_req):
-                abs_url, res_type = future_to_req[future]
-                try:
-                    data = future.result()
-                    if data:
-                        if res_type == 'css':
-                            data = self.process_css_content(data, abs_url)
-                        downloaded_data[abs_url] = data
-                except Exception:
-                    pass
+            css_to_fetch = []
+            for link in soup.find_all('link', rel='stylesheet'):
+                if link.has_attr('href'):
+                    css_to_fetch.append((link, link['href']))
 
-        for tag, attr, orig_url, abs_url, res_type in assets_to_download:
-            data = downloaded_data.get(abs_url)
-            if not data:
-                tag[attr] = abs_url
-                continue
-                
-            if res_type == 'image':
-                if attr == 'srcset':
-                    del tag['srcset']
-                    tag['src'] = data
-                else:
-                    tag[attr] = data
-            elif res_type == 'css':
-                style_tag = soup.new_tag('style')
-                style_tag.string = data
-                tag.replace_with(style_tag)
-            elif res_type == 'js':
-                script_tag = soup.new_tag('script')
-                script_tag.string = data
-                if tag.has_attr('type'): script_tag['type'] = tag['type']
-                tag.replace_with(script_tag)
+            js_to_fetch = []
+            for script in soup.find_all('script', src=True):
+                js_to_fetch.append((script, script['src']))
 
-        for style in soup.find_all('style'):
-            if style.string:
-                style.string = self.process_css_content(style.string, base_url)
+            # FETCH & REPLACE (Sequential via browser to guarantee TLS integrity)
+            
+            # 1. Process Images
+            for tag, attr, raw_url in images_to_fetch:
+                abs_url = urljoin(base_url, raw_url.split()[0]) # split()[0] handles srcset safely
+                data_uri = self.fetch_via_browser(abs_url, res_type="base64")
+                if data_uri:
+                    if attr == 'srcset':
+                        del tag['srcset']
+                        tag['src'] = data_uri
+                    else:
+                        tag[attr] = data_uri
 
-        if base_tag: base_tag.decompose()
-        for meta in soup.find_all('meta', attrs={'http-equiv': lambda x: x and x.lower() == 'content-security-policy'}):
-            meta.decompose()
+            # 2. Process CSS
+            for tag, raw_url in css_to_fetch:
+                abs_url = urljoin(base_url, raw_url)
+                css_text = self.fetch_via_browser(abs_url, res_type="text")
+                if css_text:
+                    processed_css = self.process_css_content(css_text, abs_url)
+                    style_tag = soup.new_tag('style')
+                    style_tag.string = processed_css
+                    tag.replace_with(style_tag)
 
-        return str(soup)
+            # 3. Process JS
+            for tag, raw_url in js_to_fetch:
+                abs_url = urljoin(base_url, raw_url)
+                js_text = self.fetch_via_browser(abs_url, res_type="text")
+                if js_text:
+                    script_tag = soup.new_tag('script')
+                    script_tag.string = js_text
+                    if tag.has_attr('type'): script_tag['type'] = tag['type']
+                    tag.replace_with(script_tag)
+
+            # 4. Process Inline Styles
+            for style in soup.find_all('style'):
+                if style.string:
+                    style.string = self.process_css_content(style.string, base_url)
+
+            # Clean up security blockers
+            if base_tag: base_tag.decompose()
+            for meta in soup.find_all('meta', attrs={'http-equiv': lambda x: x and x.lower() == 'content-security-policy'}):
+                meta.decompose()
+
+            browser.close()
+            return str(soup)
 
 @app.route('/')
 def index():
@@ -287,12 +357,11 @@ def archive_sync():
         return jsonify({'error': 'Invalid URL scheme. Use http or https.'}), 400
 
     try:
-        archiver = WebArchiver(url)
+        archiver = StealthArchiver(url)
         final_html = archiver.process()
         
-        # Write to Vercel's temporary directory
         job_id = str(uuid.uuid4())
-        filepath = os.path.join(TEMP_DIR, f"archive_{job_id}.html")
+        filepath = os.path.join(TEMP_DIR, f"stealth_{job_id}.html")
         
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(final_html)
@@ -301,13 +370,13 @@ def archive_sync():
         return send_file(
             filepath, 
             as_attachment=True, 
-            download_name=f"{domain}_archive.html", 
+            download_name=f"{domain}_stealth_archive.html", 
             mimetype='text/html'
         )
-    except requests.exceptions.RequestException as e:
-        return jsonify({'error': f"Failed to connect to the target website: {str(e)}"}), 502
     except Exception as e:
+        logger.error(f"Archiving error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
+    # Local requirements: pip install -r requirements.txt && playwright install chromium
     app.run(debug=True)
